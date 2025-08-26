@@ -63,6 +63,7 @@ static void button_update(Button *b, bool input_level, uint32_t now_ms,
         if (input_level != b->stable_level) { b->st = BTN_DEBOUNCE; b->last_change_ms = now_ms; }
         break;
     case BTN_DEBOUNCE:
+        // 开始
         // TODO(1a): 如果稳定超过 DEBOUNCE_MS，则确认变化，更新 stable_level；
         // 若变为按下：st->PRESSED, press_ms = now_ms
         // 若变为释放：st->IDLE（这一步通常发生在从 PRESSED/LONG 回来时）
