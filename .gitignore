@@ -1,0 +1,17 @@
+# C/C++ 常见产物
+*.o
+*.obj
+*.exe
+*.out
+*.log
+*.ilk
+*.pdb
+*.dll
+*.lib
+*.so
+*.a
+build/
+Debug/
+Release/
+# VS Code 临时
+tempCodeRunnerFile.*
