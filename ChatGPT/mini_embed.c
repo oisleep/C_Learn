@@ -63,7 +63,6 @@ static void button_update(Button *b, bool input_level, uint32_t now_ms,
         if (input_level != b->stable_level) { b->st = BTN_DEBOUNCE; b->last_change_ms = now_ms; }
         break;
     case BTN_DEBOUNCE:
-        // 开始了
         // TODO(1a): 如果稳定超过 DEBOUNCE_MS，则确认变化，更新 stable_level；
         // 若变为按下：st->PRESSED, press_ms = now_ms
         // 若变为释放：st->IDLE（这一步通常发生在从 PRESSED/LONG 回来时）
@@ -166,9 +165,11 @@ static void task_render(App *a){
     switch (a->fx.mode){
     case FX_STEADY: case FX_BREATH:
         // TODO(4a): port = on ? 0xFF : 0x00;
+        port = on ? 0xFF : 0x00;
         break;
     case FX_CHASER:
         // TODO(4b): 设置第 fx.chaser_pos 位根据 on 决定亮灭
+        port = on ? (uint8_t)(1u << a->fx.chaser_pos) : 0u;
         break;
     }
 
