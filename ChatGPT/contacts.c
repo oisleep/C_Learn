@@ -45,7 +45,7 @@ void find_contact(const char *name) {
 
 int main() {
     add_contact("Alice", "123456");
-    add_contact("Bob", "987654");
+    add_contact("Bob", "9876544862145458565321525661");
 
     show_contacts();
 
