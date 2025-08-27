@@ -3,7 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 
-/* --- 小工具：把任意逻辑下标映射到真实data下标 --- */
+/* --- 工具：把任意逻辑下标映射到真实data下标 --- */
 static inline size_t rb_mod(size_t x, size_t cap) {
     return (cap == 0) ? 0 : (x % cap);
 }
