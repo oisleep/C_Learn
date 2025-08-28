@@ -1,5 +1,6 @@
-// main.c — 串口小终端：环形缓冲输入、实时展示、发送字符串/十六进制、日志落盘
-// 架构：read_thread -> rb_push()；print_thread 周期性从 rb_pop() 打印/记录
+// main.c — 串口小终端：环形缓冲输入、实时展示、发送字符串/十六进制、日志落盘、AA55帧解析
+// 架构：read_thread -> rb_push_overwrite()；print_thread -> (raw/parse) 输出
+// 帧格式：AA 55 | LEN(1) | PAYLOAD[len] | CHK(1) ，CHK = (LEN + sum(PAYLOAD)) & 0xFF
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,7 +21,7 @@ static void ms_sleep(unsigned ms) { usleep(ms * 1000); }
 #include "D:\C_Learn\src\ringbuf\ringbuf.h"
 #include "serial_port.h"
 
-#define RB_CAP (64 * 1024) // 64 KiB 环形缓冲，更适合串口
+#define RB_CAP (64 * 1024) // 64 KiB 环形缓冲，更适合串口吞吐
 #define LINE_MAX 4096
 
 typedef enum
@@ -34,6 +35,7 @@ static SerialPort g_sp;
 static atomic_bool g_run_reader = false;
 static atomic_bool g_run_printer = false;
 static atomic_bool g_live = true;
+static atomic_bool g_parse = false; // 新增：帧解析开关
 static ViewMode g_view = VIEW_ASCII;
 
 static FILE *g_logf = NULL;
@@ -47,7 +49,7 @@ static HANDLE hReader = NULL, hPrinter = NULL;
 static pthread_t thReader, thPrinter;
 #endif
 
-/* ---- 工具 ---- */
+/* ------------------ 工具 ------------------ */
 static void chomp(char *s)
 {
     if (!s)
@@ -112,7 +114,7 @@ static size_t parse_hex_bytes(const char *line, unsigned char **out)
     return bytes;
 }
 
-static void print_hexdump_line(const unsigned char *p, size_t n)
+static void print_hex_bytes(const unsigned char *p, size_t n)
 {
     for (size_t i = 0; i < n; ++i)
     {
@@ -128,13 +130,12 @@ static void print_ascii(const unsigned char *p, size_t n)
     }
 }
 
-/* 空间不够时，丢弃最旧数据以“永不阻塞” */
+/* 空间不够时丢弃最旧数据（永不阻塞） */
 static void rb_push_overwrite(RingBuf *rb, const void *src, size_t n)
 {
     size_t freeb = rb_free_space(rb);
     if (n >= rb->cap)
     {
-        // 只保留末尾 cap 字节
         const unsigned char *p = (const unsigned char *)src + (n - rb->cap);
         rb_clear(rb);
         rb_push(rb, p, rb->cap);
@@ -158,7 +159,107 @@ static void rb_push_overwrite(RingBuf *rb, const void *src, size_t n)
     rb_push(rb, src, n);
 }
 
-/* ---- 线程：串口读取 ---- */
+/* ------------------ 帧解析工具 ------------------ */
+// CHK = (LEN + sum(PAYLOAD)) & 0xFF
+static unsigned calc_chk(uint8_t len, const uint8_t *payload)
+{
+    unsigned s = len;
+    for (unsigned i = 0; i < len; ++i)
+        s += payload[i];
+    return s & 0xFFu;
+}
+
+/*
+ * 从环缓冲里尝试弹出一帧：
+ *  1  -> 成功取出，若 out/out_len 非空则拷贝负载
+ *  0  -> 目前没有完整帧（或丢弃了部分噪声），可继续循环或等待新字节
+ * -1  -> 数据不足（保持现场）
+ */
+static int try_pop_one_frame(RingBuf *rb, uint8_t *out, size_t *out_len)
+{
+    static const uint8_t HDR[2] = {0xAA, 0x55};
+
+    // 找到帧头偏移
+    size_t idx = 0;
+    if (!rb_search(rb, HDR, 2, &idx))
+    {
+        // 没有帧头：丢弃当前所有噪声，避免无尽积压
+        size_t junk = rb_size(rb);
+        if (junk > 0)
+        {
+            uint8_t tmp[256];
+            while (junk)
+            {
+                size_t step = junk > sizeof(tmp) ? sizeof(tmp) : junk;
+                rb_pop(rb, tmp, step);
+                junk -= step;
+            }
+        }
+        return 0;
+    }
+
+    // 丢掉帧头之前的噪声
+    if (idx > 0)
+    {
+        uint8_t tmp[256];
+        size_t left = idx;
+        while (left)
+        {
+            size_t step = left > sizeof(tmp) ? sizeof(tmp) : left;
+            rb_pop(rb, tmp, step);
+            left -= step;
+        }
+    }
+
+    // 至少需要 AA 55 LEN 三字节
+    if (rb_size(rb) < 3)
+        return -1;
+
+    // PEEK 出 LEN
+    uint8_t len = 0;
+    if (rb_peek(rb, &len, 1, 2) != 1)
+        return -1;
+
+    size_t total = 2 + 1 + len + 1; // HDR + LEN + PAYLOAD + CHK
+    if (rb_size(rb) < total)
+        return -1;
+
+    // POP 出整帧
+    uint8_t frame[2 + 1 + 255 + 1];
+    size_t got = rb_pop(rb, frame, total);
+    if (got != total)
+        return -1;
+
+    // 校验头（极端竞争下的保险）
+    if (!(frame[0] == 0xAA && frame[1] == 0x55))
+    {
+        // 丢 1 字节后继续
+        uint8_t dummy;
+        rb_pop(rb, &dummy, 1);
+        return 0;
+    }
+
+    // 校验 CHK
+    unsigned chk = calc_chk(frame[2], &frame[3]);
+    if (((uint8_t)chk) != frame[total - 1])
+    {
+        // 校验失败，放弃这帧（也可选择更激进的丢弃策略）
+        return 0;
+    }
+
+    // 输出负载
+    if (out && out_len)
+    {
+        size_t n = frame[2];
+        if (*out_len < n)
+            n = *out_len;
+        memcpy(out, &frame[3], n);
+        *out_len = n;
+    }
+    return 1;
+}
+
+/* ------------------ 线程：串口读取 ------------------ */
 #ifdef _WIN32
 static DWORD WINAPI reader_thread(LPVOID arg)
 {
@@ -182,9 +283,9 @@ static void *reader_thread(void *arg)
             continue;
         }
         if (r == 0)
-        { /* 超时 */
+        {
             continue;
-        }
+        } // 短超时
         rb_push_overwrite(&g_rb, buf, (size_t)r);
         g_total_rx += (unsigned long)r;
         if (g_logf)
@@ -200,7 +301,7 @@ static void *reader_thread(void *arg)
 #endif
 }
 
-/* ---- 线程：展示（实时从环里弹出并打印） ---- */
+/* ------------------ 线程：展示（原始/解析） ------------------ */
 #ifdef _WIN32
 static DWORD WINAPI printer_thread(LPVOID arg)
 {
@@ -210,6 +311,7 @@ static void *printer_thread(void *arg)
 #endif
     (void)arg;
     unsigned char buf[4096];
+
     while (atomic_load(&g_run_printer))
     {
         if (!atomic_load(&g_live))
@@ -217,6 +319,48 @@ static void *printer_thread(void *arg)
             ms_sleep(50);
             continue;
         }
+
+        if (atomic_load(&g_parse))
+        {
+            // 解析模式：尽可能多地吃完整帧
+            int progressed = 0;
+            for (;;)
+            {
+                uint8_t payload[512];
+                size_t n = sizeof(payload);
+                int ret = try_pop_one_frame(&g_rb, payload, &n);
+                if (ret == 1)
+                {
+                    // 打印一帧
+                    if (g_view == VIEW_ASCII)
+                    {
+                        printf("\n[FRAME len=%zu] ", n);
+                        print_ascii(payload, n);
+                    }
+                    else
+                    {
+                        printf("\n[FRAME len=%zu] ", n);
+                        print_hex_bytes(payload, n);
+                    }
+                    fflush(stdout);
+                    progressed = 1;
+                    continue; // 看看是否还有下一帧
+                }
+                else if (ret == 0)
+                {
+                    break; // 当前没有完整帧（或丢了噪声），休息一下
+                }
+                else
+                { // -1 数据不足
+                    break;
+                }
+            }
+            if (!progressed)
+                ms_sleep(20);
+            continue;
+        }
+
+        // 非解析模式：弹块打印
         size_t avail = rb_size(&g_rb);
         if (avail == 0)
         {
@@ -228,13 +372,9 @@ static void *printer_thread(void *arg)
         if (got)
         {
             if (g_view == VIEW_ASCII)
-            {
                 print_ascii(buf, got);
-            }
             else
-            {
-                print_hexdump_line(buf, got);
-            }
+                print_hex_bytes(buf, got);
             fflush(stdout);
         }
     }
@@ -245,7 +385,7 @@ static void *printer_thread(void *arg)
 #endif
 }
 
-/* ---- 命令行 ---- */
+/* ------------------ 命令行 ------------------ */
 static void print_help(void)
 {
     printf(
@@ -253,9 +393,10 @@ static void print_help(void)
         "  open <port> <baud>    打开串口（Win: COM3  Linux/mac: /dev/ttyUSB0）\n"
         "  close                 关闭串口\n"
         "  txs <字符串>          发送字符串（原样字节）\n"
-        "  txx <hex...>          发送十六进制，如：txx 55 AA 01 02 0x0D 0A\n"
+        "  txx <hex...>          发送十六进制，如：txx 55 AA 01 02 0D 0A\n"
         "  live on|off           实时打印开关（默认 on）\n"
         "  mode ascii|hex        打印模式（ASCII/HEX）\n"
+        "  parse on|off          帧解析开关（AA 55 | LEN | PAYLOAD | CHK）\n"
         "  log on [file]         开启日志到文件（默认 serial.log）\n"
         "  log off               关闭日志\n"
         "  dump [N]              从缓冲 peek 最多 N 字节（不消费，默认 256）\n"
@@ -267,7 +408,6 @@ static void print_help(void)
 
 int main(void)
 {
-    // init rb
     if (!rb_init(&g_rb, RB_CAP))
     {
         fprintf(stderr, "ring buffer init failed\n");
@@ -277,8 +417,8 @@ int main(void)
     atomic_store(&g_run_reader, true);
     atomic_store(&g_run_printer, true);
     atomic_store(&g_live, true);
+    atomic_store(&g_parse, false);
 
-    // 启动线程
 #ifdef _WIN32
     hReader = CreateThread(NULL, 0, reader_thread, NULL, 0, NULL);
     hPrinter = CreateThread(NULL, 0, printer_thread, NULL, 0, NULL);
@@ -331,7 +471,6 @@ int main(void)
             }
             char port[128] = {0};
             int baud = 115200;
-            // 解析两个参数
             int got = sscanf(args, "%127s %d", port, &baud);
             if (got < 1)
             {
@@ -343,13 +482,9 @@ int main(void)
                 sp_close(&g_sp);
             }
             if (sp_open(&g_sp, port, baud))
-            {
                 printf("打开成功：%s @ %d 8N1\n", port, baud);
-            }
             else
-            {
                 printf("打开失败。\n");
-            }
         }
         else if (!strcmp(cmd, "close"))
         {
@@ -431,6 +566,20 @@ int main(void)
             else
                 printf("用法：mode ascii|hex\n");
         }
+        else if (!strcmp(cmd, "parse"))
+        {
+            if (!*args)
+            {
+                printf("parse = %s\n", atomic_load(&g_parse) ? "on" : "off");
+                continue;
+            }
+            if (!strcmp(args, "on"))
+                atomic_store(&g_parse, true);
+            else if (!strcmp(args, "off"))
+                atomic_store(&g_parse, false);
+            else
+                printf("用法：parse on|off\n");
+        }
         else if (!strcmp(cmd, "log"))
         {
             if (!*args)
@@ -494,7 +643,7 @@ int main(void)
             if (g_view == VIEW_ASCII)
                 print_ascii(buf, got);
             else
-                print_hexdump_line(buf, got);
+                print_hex_bytes(buf, got);
             putchar('\n');
             free(buf);
         }
@@ -536,7 +685,7 @@ int main(void)
         }
     }
 
-    // 退出收尾
+    // 收尾
     atomic_store(&g_run_reader, false);
     atomic_store(&g_run_printer, false);
     ms_sleep(100);
