@@ -1,5 +1,6 @@
 {
     "files.associations": {
-        "serial_port.h": "c"
+        "serial_port.h": "c",
+        "ringbuf.h": "c"
     }
 }
